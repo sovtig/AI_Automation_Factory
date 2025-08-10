@@ -17,6 +17,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 
 from config import settings
+import time
+from fastapi import Request
 from models.database import init_db, get_db, database
 from models.models import Task, TaskLog, TaskStatus, TaskPriority, Feedback, File as FileModel
 from workflows.file_manager import FileManager
@@ -39,6 +41,36 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="AI Automation Factory", version="0.1.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+
+@app.middleware("http")
+async def log_api_requests(request: Request, call_next):
+    from models.models import APILog  # Local import to prevent circular dependency issues
+    start_time = time.time()
+
+    response = await call_next(request)
+
+    process_time = time.time() - start_time
+
+    # Use a separate session for logging to avoid interfering with request transactions
+    async with database.session_factory() as db_session:
+        try:
+            log_entry = APILog(
+                method=request.method,
+                path=request.url.path,
+                status_code=response.status_code,
+                client_host=request.client.host,
+                process_time=process_time,
+                request_headers=dict(request.headers),
+                response_headers=dict(response.headers),
+            )
+            db_session.add(log_entry)
+            await db_session.commit()
+        except Exception as e:
+            logger.error(f"Failed to log API request: {e}")
+
+    return response
+
 
 task_manager = TaskManager()
 file_manager = FileManager(
