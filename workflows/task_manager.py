@@ -111,9 +111,9 @@ class Task:
 class TaskManager:
     def __init__(self, max_concurrent_tasks: int = 5):
         self.tasks: Dict[str, Task] = {}
-        self.task_queue = asyncio.PriorityQueue()
+        self.task_queue = None
         self.max_concurrent_tasks = max_concurrent_tasks
-        self.semaphore = asyncio.Semaphore(max_concurrent_tasks)
+        self.semaphore = None
         self.logger = logger.bind(component="TaskManager")
         self._is_running = False
         self._task_executors = set()
@@ -160,6 +160,8 @@ class TaskManager:
             return
             
         self._is_running = True
+        self.task_queue = asyncio.PriorityQueue()
+        self.semaphore = asyncio.Semaphore(self.max_concurrent_tasks)
         self.logger.info("Starting task manager")
         
         while self._is_running or not self.task_queue.empty():

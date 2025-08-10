@@ -41,7 +41,9 @@ mkdocs-material>=9.0.0
 # Uncomment if you need these features
 # opencv-python-headless>=4.7.0  # For advanced image processing
 # python-multipart>=0.0.6  # For file uploads in FastAPI
-# aiosqlite>=0.17.0  # For async SQLite database operations
+aiosqlite>=0.17.0
+sqlalchemy>=2.0.0
+pydantic-settings>=2.0.0
 requests>=2.28.1
 python-pptx>=0.6.21
 openpyxl>=3.0.10

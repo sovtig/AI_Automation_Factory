@@ -3,6 +3,7 @@ Database models for AI Automation Factory.
 
 This module defines the SQLAlchemy models for the application.
 """
+import asyncio
 from datetime import datetime
 from enum import Enum as PyEnum
 from typing import List, Optional, Dict, Any
@@ -19,7 +20,9 @@ from sqlalchemy import (
     Enum,
     Table,
     func,
-    event
+    event,
+    Float,
+    inspect
 )
 from sqlalchemy.orm import relationship, Mapped, mapped_column
 from sqlalchemy.ext.asyncio import AsyncAttrs
@@ -55,7 +58,7 @@ class User(AsyncAttrs, Base):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     is_verified: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), onupdate=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     last_login: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     
     # Relationships
@@ -180,7 +183,7 @@ class File(AsyncAttrs, Base):
     metadata_: Mapped[Optional[Dict[str, Any]]] = mapped_column('metadata', JSON, nullable=True)
     is_public: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), onupdate=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     owner_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey('users.id', ondelete='SET NULL'))
     
     # Relationships
@@ -214,46 +217,20 @@ class APILog(AsyncAttrs, Base):
     def __repr__(self):
         return f"<APILog(id={self.id}, {self.method} {self.path} {self.status_code})>"
 
-# Event listeners
-@event.listens_for(Task, 'after_insert')
-def task_after_insert(mapper, connection, task):
-    """Log task creation."""
-    from .database import database
-    
-    async def log_task_creation():
-        async with database.session() as session:
-            log = TaskLog(
-                task_id=task.id,
-                level='info',
-                message=f"Task '{task.name}' created with status '{task.status}'"
-            )
-            session.add(log)
-            await session.commit()
-    
-    asyncio.create_task(log_task_creation())
+class Feedback(AsyncAttrs, Base):
+    """Feedback model for collecting user feedback on tasks."""
+    __tablename__ = 'feedback'
 
-@event.listens_for(Task, 'after_update')
-def task_after_update(mapper, connection, task):
-    """Log task status changes."""
-    from .database import database
-    
-    # Get the previous state of the task
-    history = inspect(task).attrs
-    status_history = history.status.history
-    
-    # Only log if status has changed
-    if status_history.has_changes():
-        old_status = status_history.deleted[0] if status_history.deleted else None
-        new_status = task.status
-        
-        async def log_status_change():
-            async with database.session() as session:
-                log = TaskLog(
-                    task_id=task.id,
-                    level='info',
-                    message=f"Task status changed from '{old_status}' to '{new_status}'"
-                )
-                session.add(log)
-                await session.commit()
-        
-        asyncio.create_task(log_status_change())
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    task_id: Mapped[int] = mapped_column(Integer, ForeignKey('tasks.id', ondelete='CASCADE'), nullable=False)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    type: Mapped[str] = mapped_column(String(50), nullable=False)  # e.g., 'rating', 'comment'
+    content: Mapped[Dict[str, Any]] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    # Relationships
+    task: Mapped['Task'] = relationship('Task')
+    user: Mapped[Optional['User']] = relationship('User')
+
+    def __repr__(self):
+        return f"<Feedback(id={self.id}, task_id={self.task_id}, type='{self.type}')>"

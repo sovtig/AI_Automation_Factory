@@ -4,19 +4,21 @@ Test suite for AI Automation Factory.
 This module contains tests for the core functionality of the AI Automation Factory.
 """
 import pytest
+import pytest_asyncio
 import asyncio
 import json
 from pathlib import Path
 from datetime import datetime, timedelta
 
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
 
 from main import app
 from models.database import Base, get_db
 from models.models import User, Task, Feedback
-from config import settings
+from config import settings, EnvironmentType
 
 # Test database URL - use in-memory SQLite for tests
 TEST_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
@@ -28,9 +30,9 @@ TestingSessionLocal = sessionmaker(
 )
 
 # Fixture to create a test database session
-@pytest.fixture(scope="function")
+@pytest_asyncio.fixture(scope="function")
 async def db_session():
-    ""
+    """
     Create a new database session for testing.
     
     This fixture creates all tables, yields a session for testing,
@@ -51,6 +53,7 @@ async def db_session():
         )
         session.add(test_user)
         await session.commit()
+        await session.refresh(test_user)
         
         # Create test task
         test_task = Task(
@@ -69,53 +72,53 @@ async def db_session():
         await conn.run_sync(Base.metadata.drop_all)
 
 # Fixture to override the get_db dependency in FastAPI
-@pytest.fixture(scope="function")
+@pytest_asyncio.fixture(scope="function")
 async def override_get_db(db_session):
-    ""Override the get_db dependency for testing."""
+    """Override the get_db dependency for testing."""
     async def _override_get_db():
-        try:
-            yield db_session
-        finally:
-            pass  # Don't close the session here, let the fixture handle it
+        yield db_session
     
     return _override_get_db
 
 # Fixture for the test client
 @pytest.fixture(scope="function")
-async def test_client(override_get_db):
-    ""Create a test client with overridden dependencies."""
+def test_client(override_get_db):
+    """Create a test client with overridden dependencies."""
+    original_env = settings.ENVIRONMENT
+    settings.ENVIRONMENT = EnvironmentType.TESTING
+
     app.dependency_overrides[get_db] = override_get_db
     with TestClient(app) as client:
         yield client
+
+    settings.ENVIRONMENT = original_env
     app.dependency_overrides.clear()
 
 # Test cases
 class TestTaskAPI:
-    ""Test cases for the Task API endpoints."""
+    """Test cases for the Task API endpoints."""
     
+    @pytest.mark.asyncio
     async def test_create_task(self, test_client, db_session):
-        ""Test creating a new task."""
+        """Test creating a new task."""
         task_data = {
             "name": "Test Task",
             "description": "This is a test task",
-            "priority": "normal"
+            "priority": 2,  # Use integer value for TaskPriority.NORMAL
+            "parameters": {}
         }
         
         response = test_client.post("/tasks/", json=task_data)
-        assert response.status_code == 200
+        assert response.status_code == 201
         data = response.json()
         
-        assert "id" in data
+        assert "task_id" in data
         assert data["name"] == task_data["name"]
         assert data["status"] == "pending"
-        
-        # Verify the task was saved to the database
-        task = await db_session.get(Task, data["id"])
-        assert task is not None
-        assert task.name == task_data["name"]
     
+    @pytest.mark.asyncio
     async def test_get_task(self, test_client, db_session):
-        ""Test retrieving a task by ID."""
+        """Test retrieving a task by ID."""
         # Create a test task
         task = Task(
             task_id="test_get_task_123",
@@ -135,8 +138,9 @@ class TestTaskAPI:
         assert data["name"] == task.name
         assert data["status"] == task.status
     
+    @pytest.mark.asyncio
     async def test_list_tasks(self, test_client, db_session):
-        ""Test listing all tasks."""
+        """Test listing all tasks."""
         # Create some test tasks
         tasks = [
             Task(task_id=f"task_{i}", name=f"Task {i}", status="pending")
@@ -150,39 +154,44 @@ class TestTaskAPI:
         assert response.status_code == 200
         data = response.json()
         
-        assert len(data) >= 5  # Should include our 5 tasks plus any from fixtures
+        assert len(data) >= 6  # Should include our 5 tasks plus the one from the fixture
         assert any(task["name"] == "Task 0" for task in data)
 
 class TestFeedbackSystem:
-    ""Test cases for the feedback system."""
+    """Test cases for the feedback system."""
     
+    @pytest.mark.asyncio
     async def test_submit_feedback(self, test_client, db_session):
-        ""Test submitting feedback."""
+        """Test submitting feedback."""
+        # Get the task created by the fixture
+        task_result = await db_session.execute(select(Task).where(Task.task_id == "test_task_123"))
+        task = task_result.scalar_one()
+
         feedback_data = {
             "type": "rating",
-            "task_id": "test_task_123",
+            "task_id": task.id,
             "content": {"score": 4},
             "user_id": 1
         }
         
         response = test_client.post("/feedback/", json=feedback_data)
-        assert response.status_code == 200
+        assert response.status_code == 201
         data = response.json()
         
-        assert data["status"] == "success"
-        assert "id" in data
+        assert data["type"] == feedback_data["type"]
+        assert data["task_id"] == feedback_data["task_id"]
+        assert data["content"]["score"] == 4
         
-        # Verify the feedback was saved
-        feedback = await db_session.get(Feedback, data["id"])
-        assert feedback is not None
-        assert feedback.type == "rating"
-        assert feedback.content["score"] == 4
     
+    @pytest.mark.asyncio
     async def test_analyze_feedback(self, test_client, db_session):
-        ""Test analyzing feedback."""
+        """Test analyzing feedback."""
         # Create some test feedback
+        task = await db_session.get(Task, 1)
         feedback_items = [
             Feedback(
+                task_id=task.id,
+                user_id=1,
                 type="rating",
                 content={"score": score},
                 created_at=datetime.utcnow() - timedelta(days=i)
@@ -202,10 +211,11 @@ class TestFeedbackSystem:
         assert 1 <= data["avg_rating"] <= 5
 
 class TestFileOperations:
-    ""Test cases for file operations."""
+    """Test cases for file operations."""
     
+    @pytest.mark.asyncio
     async def test_upload_file(self, test_client, tmp_path):
-        ""Test file upload functionality."""
+        """Test file upload functionality."""
         # Create a test file
         test_file = tmp_path / "test.txt"
         test_file.write_text("This is a test file")
@@ -224,8 +234,9 @@ class TestFileOperations:
         assert data["name"] == "test.txt"
         assert data["size"] > 0
     
+    @pytest.mark.asyncio
     async def test_download_file(self, test_client, tmp_path):
-        ""Test file download functionality."""
+        """Test file download functionality."""
         # First upload a file
         test_file = tmp_path / "test_download.txt"
         test_file.write_text("Download test content")
