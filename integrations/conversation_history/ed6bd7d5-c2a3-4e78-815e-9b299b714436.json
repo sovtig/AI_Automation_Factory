@@ -1,0 +1,12 @@
+{
+  "Title": "Test Conversation",
+  "Tags": [],
+  "Messages": [],
+  "Id": "ed6bd7d5-c2a3-4e78-815e-9b299b714436",
+  "Metadata": {
+    "Model": "gpt-4",
+    "SystemPrompt": "You are a test assistant.",
+    "Created": "2025-08-10T16:14:11.1386019-04:00"
+  },
+  "Description": "Test Description"
+}

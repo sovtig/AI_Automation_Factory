@@ -1,0 +1,12 @@
+{
+  "Title": "Test",
+  "Metadata": {
+    "Model": "gpt-4",
+    "Created": "2025-08-10T16:16:26.4867212-04:00",
+    "SystemPrompt": "You are a helpful assistant."
+  },
+  "Messages": [],
+  "Tags": [],
+  "Description": "Test",
+  "Id": "8fd2f2ff-0811-45a3-94ef-97130c5cd439"
+}

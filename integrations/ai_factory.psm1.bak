@@ -1,0 +1,1062 @@
+# AI FACTORY INTEGRATION MODULE
+# Provides PowerShell integration with the AI Factory and GLASP RAG system
+# Version: 2.1.0
+# Last Updated: 08/09/2025
+
+#Requires -Version 7.0
+
+#region Module Configuration
+
+$script:ModuleConfig = @{
+    APIVersion = 'v1'
+    TimeoutSec = 30
+    RetryCount = 3
+    RetryDelaySec = 2
+    EnableLogging = $true
+    LogPath = Join-Path -Path $PSScriptRoot -ChildPath 'ai_factory.log'
+    HistoryPath = Join-Path -Path $PSScriptRoot -ChildPath 'conversation_history'
+    MaxHistoryItems = 100
+    MaxContextTokens = 4000
+    EnableRAG = $true
+}
+
+# Create history directory if it doesn't exist
+if (-not (Test-Path -Path $script:ModuleConfig.HistoryPath)) {
+    New-Item -ItemType Directory -Path $script:ModuleConfig.HistoryPath -Force | Out-Null
+}
+
+#region Conversation History Management
+
+class ConversationMessage {
+    [string]$Role        # 'user', 'assistant', or 'system'
+    [string]$Content     # The message content
+    [datetime]$Timestamp # When the message was created
+    [hashtable]$Metadata # Additional metadata (RAG context, sources, etc.)
+    
+    ConversationMessage([string]$Role, [string]$Content, [hashtable]$Metadata = @{}) {
+        $this.Role = $Role
+        $this.Content = $Content
+        $this.Timestamp = [datetime]::UtcNow
+        $this.Metadata = $Metadata
+    }
+    
+    [hashtable]ToHashtable() {
+        return @{
+            Role = $this.Role
+            Content = $this.Content
+            Timestamp = $this.Timestamp.ToString('o')
+            Metadata = $this.Metadata
+        }
+    }
+    
+    static [ConversationMessage]FromHashtable([hashtable]$data) {
+        $msg = [ConversationMessage]::new(
+            $data.Role,
+            $data.Content,
+            $data.Metadata ?? @{}
+        )
+        $msg.Timestamp = [datetime]::Parse($data.Timestamp)
+        return $msg
+    }
+}
+
+class Conversation {
+    [string]$Id
+    [string]$Title
+    [System.Collections.Generic.List[ConversationMessage]]$Messages
+    [datetime]$Created
+    [datetime]$LastUpdated
+    [hashtable]$Metadata
+    
+    Conversation() {
+        $this.Id = [guid]::NewGuid().ToString()
+        $this.Title = "New Conversation $(Get-Date -Format 'yyyy-MM-dd HH:mm')"
+        $this.Messages = [System.Collections.Generic.List[ConversationMessage]]::new()
+        $this.Created = [datetime]::UtcNow
+        $this.LastUpdated = [datetime]::UtcNow
+        $this.Metadata = @{
+            Model = $null
+            SystemPrompt = $null
+            Tags = @()
+        }
+    }
+    
+    [void]AddMessage([string]$Role, [string]$Content, [hashtable]$Metadata = @{}) {
+        $this.Messages.Add([ConversationMessage]::new($Role, $Content, $Metadata))
+        $this.LastUpdated = [datetime]::UtcNow
+    }
+    
+    [void]AddMessage([ConversationMessage]$Message) {
+        $this.Messages.Add($Message)
+        $this.LastUpdated = [datetime]::UtcNow
+    }
+    
+    [hashtable]ToHashtable() {
+        return @{
+            Id = $this.Id
+            Title = $this.Title
+            Created = $this.Created.ToString('o')
+            LastUpdated = $this.LastUpdated.ToString('o')
+            Metadata = $this.Metadata
+            Messages = $this.Messages | ForEach-Object { $_.ToHashtable() }
+        }
+    }
+    
+    static [Conversation]FromHashtable([hashtable]$data) {
+        $conv = [Conversation]::new()
+        $conv.Id = $data.Id
+        $conv.Title = $data.Title
+        $conv.Created = [datetime]::Parse($data.Created)
+        $conv.LastUpdated = [datetime]::Parse($data.LastUpdated)
+        $conv.Metadata = $data.Metadata ?? @{}
+        
+        $conv.Messages.Clear()
+        foreach ($msgData in $data.Messages) {
+            $conv.Messages.Add([ConversationMessage]::FromHashtable($msgData))
+        }
+        
+        return $conv
+    }
+    
+    [string]GetConversationContext([int]$maxTokens = 4000) {
+        # Start with system message if exists
+        $context = @()
+        $tokenCount = 0
+        
+        # Add system prompt if available
+        if ($this.Metadata.SystemPrompt) {
+            $sysMsg = [ConversationMessage]::new('system', $this.Metadata.SystemPrompt)
+            $context += $sysMsg
+            $tokenCount += $this.EstimateTokenCount($sysMsg.Content)
+        }
+        
+        # Add messages in reverse order until we hit the token limit
+        $messagesToInclude = [System.Collections.Generic.List[ConversationMessage]]::new()
+        
+        for ($i = $this.Messages.Count - 1; $i -ge 0; $i--) {
+            $msg = $this.Messages[$i]
+            $msgTokens = $this.EstimateTokenCount($msg.Content)
+            
+            # Add message tokens plus some overhead for metadata
+            $totalMsgTokens = [math]::Ceiling($msgTokens * 1.1)
+            
+            if (($tokenCount + $totalMsgTokens) -gt $maxTokens) {
+                break
+            }
+            
+            $messagesToInclude.Insert(0, $msg)
+            $tokenCount += $totalMsgTokens
+        }
+        
+        # Convert to array of hashtables for the API
+        return $messagesToInclude | ForEach-Object { $_.ToHashtable() } | ConvertTo-Json -Depth 10 -Compress
+    }
+    
+    [int]EstimateTokenCount([string]$text) {
+        # Rough estimation: ~4 characters per token on average
+        return [math]::Max(1, [math]::Ceiling($text.Length / 4))
+    }
+}
+
+function Get-Conversation {
+    [CmdletBinding()]
+    param(
+        [Parameter(Position = 0)]
+        [string]$Id,
+        
+        [Parameter()]
+        [int]$Limit = 20,
+        
+        [Parameter()]
+        [string]$Tag
+    )
+    
+    try {
+        if ($Id) {
+            $path = Join-Path -Path $script:ModuleConfig.HistoryPath -ChildPath "$Id.json"
+            if (Test-Path -Path $path) {
+                $data = Get-Content -Path $path -Raw | ConvertFrom-Json -AsHashtable
+                return [Conversation]::FromHashtable($data)
+            }
+            return $null
+        }
+        
+        # List all conversations
+        $conversations = Get-ChildItem -Path $script:ModuleConfig.HistoryPath -Filter "*.json" | 
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First $Limit |
+            ForEach-Object {
+                $data = Get-Content -Path $_.FullName -Raw | ConvertFrom-Json -AsHashtable
+                [Conversation]::FromHashtable($data)
+            }
+        
+        # Filter by tag if specified
+        if ($Tag) {
+            $conversations = $conversations | Where-Object { 
+                $_.Metadata.Tags -and $_.Metadata.Tags -contains $Tag 
+            }
+        }
+        
+        return $conversations
+    }
+    catch {
+        Write-Error "Failed to get conversation: $_"
+        return $null
+    }
+}
+
+function New-Conversation {
+    [CmdletBinding()]
+    param(
+        [Parameter()]
+        [string]$Title,
+        
+        [Parameter()]
+        [string]$SystemPrompt,
+        
+        [Parameter()]
+        [string]$Model,
+        
+        [Parameter()]
+        [string[]]$Tags
+    )
+    
+    try {
+        $conversation = [Conversation]::new()
+        
+        if ($Title) { $conversation.Title = $Title }
+        if ($SystemPrompt) { $conversation.Metadata.SystemPrompt = $SystemPrompt }
+        if ($Model) { $conversation.Metadata.Model = $Model }
+        if ($Tags) { $conversation.Metadata.Tags = $Tags }
+        
+        # Save the new conversation
+        Save-Conversation -Conversation $conversation
+        
+        return $conversation
+    }
+    catch {
+        Write-Error "Failed to create new conversation: $_"
+        return $null
+    }
+}
+
+function Save-Conversation {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true, ValueFromPipeline = $true)]
+        [Conversation]$Conversation
+    )
+    
+    try {
+        $path = Join-Path -Path $script:ModuleConfig.HistoryPath -ChildPath "$($Conversation.Id).json"
+        $Conversation.ToHashtable() | ConvertTo-Json -Depth 10 | Set-Content -Path $path -Force
+        return $true
+    }
+    catch {
+        Write-Error "Failed to save conversation: $_"
+        return $false
+    }
+}
+
+function Remove-Conversation {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true, Position = 0)]
+        [string]$Id
+    )
+    
+    try {
+        $path = Join-Path -Path $script:ModuleConfig.HistoryPath -ChildPath "$Id.json"
+        if (Test-Path -Path $path) {
+            Remove-Item -Path $path -Force
+            return $true
+        }
+        return $false
+    }
+    catch {
+        Write-Error "Failed to remove conversation: $_"
+        return $false
+    }
+}
+
+function Add-ConversationMessage {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ConversationId,
+        
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('user', 'assistant', 'system')]
+        [string]$Role,
+        
+        [Parameter(Mandatory = $true)]
+        [string]$Content,
+        
+        [Parameter()]
+        [hashtable]$Metadata = @{}
+    )
+    
+    try {
+        $conversation = Get-Conversation -Id $ConversationId
+        if (-not $conversation) {
+            Write-Error "Conversation not found: $ConversationId"
+            return $false
+        }
+        
+        $conversation.AddMessage($Role, $Content, $Metadata)
+        Save-Conversation -Conversation $conversation | Out-Null
+        
+        return $true
+    }
+    catch {
+        Write-Error "Failed to add message to conversation: $_"
+        return $false
+    }
+}
+
+function Invoke-AIFactoryChat {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ConversationId,
+        
+        [Parameter(Mandatory = $true)]
+        [string]$Message,
+        
+        [Parameter()]
+        [string]$Model = $script:ModuleConfig.DefaultModel,
+        
+        [Parameter()]
+        [switch]$EnableRAG = $script:ModuleConfig.EnableRAG,
+        
+        [Parameter()]
+        [int]$MaxTokens = 2000,
+        
+        [Parameter()]
+        [double]$Temperature = 0.7,
+        
+        [Parameter()]
+        [hashtable]$Metadata = @{}
+    )
+    
+    try {
+        # Get or create the conversation
+        $conversation = Get-Conversation -Id $ConversationId
+        if (-not $conversation) {
+            $conversation = New-Conversation -Model $Model -Title "Chat $(Get-Date -Format 'yyyy-MM-dd HH:mm')"
+            $ConversationId = $conversation.Id
+        }
+        
+        # Add user message to conversation
+        Add-ConversationMessage -ConversationId $ConversationId -Role 'user' -Content $Message -Metadata $Metadata
+        
+        # Prepare context from conversation history
+        $context = $conversation.GetConversationContext($script:ModuleConfig.MaxContextTokens)
+        
+        # Initialize RAG context
+        $ragContext = @()
+        
+        # If RAG is enabled, retrieve relevant context
+        if ($EnableRAG) {
+            try {
+                $searchResults = Search-GlaspContext -Query $Message -Limit 3
+                if ($searchResults -and $searchResults.Count -gt 0) {
+                    $ragContext = $searchResults | ForEach-Object {
+                        @{
+                            role = 'system'
+                            content = "[RAG Context] $($_.Content)"
+                            source = $_.Source
+                            relevance = $_.Relevance
+                        }
+                    }
+                    
+                    # Add RAG context to metadata
+                    $Metadata['RAG_Context'] = $ragContext | Select-Object -First 1 -ExpandProperty content
+                    $Metadata['RAG_Sources'] = $ragContext | ForEach-Object { $_.source } | Select-Object -Unique
+                }
+            }
+            catch {
+                Write-Warning "Failed to retrieve RAG context: $_"
+                $Metadata['RAG_Error'] = $_.Exception.Message
+            }
+        }
+        
+        # Prepare messages for the API
+        $messages = @()
+        
+        # Add system message if defined
+        if ($conversation.Metadata.SystemPrompt) {
+            $messages += @{
+                role = 'system'
+                content = $conversation.Metadata.SystemPrompt
+            }
+        }
+        
+        # Add RAG context if available
+        $messages += $ragContext
+        
+        # Add conversation history
+        $history = $context | ConvertFrom-Json -AsHashtable
+        $messages += $history
+        
+        # Add the current user message
+        $messages += @{
+            role = 'user'
+            content = $Message
+        }
+        
+        # Call the AI API
+        $params = @{
+            Model = $Model
+            Messages = $messages
+            MaxTokens = $MaxTokens
+            Temperature = $Temperature
+            Stream = $false
+        }
+        
+        $response = Invoke-AIFactoryCompletion @params
+        
+        if (-not $response.Success) {
+            throw $response.Error
+        }
+        
+        # Add assistant response to conversation
+        $assistantMessage = $response.Choices[0].Message.Content
+        Add-ConversationMessage -ConversationId $ConversationId -Role 'assistant' -Content $assistantMessage -Metadata @{
+            Model = $Model
+            Temperature = $Temperature
+            TokensUsed = $response.Usage.TotalTokens
+            Timestamp = [datetime]::UtcNow
+        }
+        
+        # Return the response with conversation context
+        return @{
+            Success = $true
+            Response = $assistantMessage
+            ConversationId = $ConversationId
+            TokensUsed = $response.Usage.TotalTokens
+            Metadata = $Metadata
+        }
+    }
+    catch {
+        Write-Error "Chat failed: $_"
+        return @{
+            Success = $false
+            Error = $_.Exception.Message
+            ConversationId = $ConversationId
+        }
+    }
+}
+
+# Export the conversation management functions
+export-modulemember -Function Get-Conversation, New-Conversation, Save-Conversation, Remove-Conversation, Add-ConversationMessage, Invoke-AIFactoryChat
+
+# Cache for frequently accessed data
+$script:Cache = @{
+    Models = $null
+    LastModelUpdate = $null
+    CacheDuration = [TimeSpan]::FromMinutes(30)
+}
+
+# Performance metrics
+$script:PerformanceMetrics = @{
+    TotalRequests = 0
+    FailedRequests = 0
+    AverageResponseTimeMs = 0
+    LastError = $null
+}
+
+#endregion
+
+#region Private Functions
+
+function Write-Log {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$Message,
+        
+        [ValidateSet('Info', 'Warning', 'Error', 'Debug')]
+        [string]$Level = 'Info',
+        
+        [switch]$NoConsoleOutput
+    )
+    
+    $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    $logMessage = "[$timestamp] [$Level] $Message"
+    
+    if (-not $NoConsoleOutput) {
+        $params = @{
+            Message = $logMessage
+            NoNewline = $false
+        }
+        
+        switch ($Level) {
+            'Error'   { Write-Error @params -ErrorAction Continue }
+            'Warning' { Write-Warning $logMessage }
+            'Debug'   { Write-Debug $logMessage }
+            default   { Write-Information $logMessage -InformationAction Continue }
+        }
+    }
+    
+    if ($script:ModuleConfig.EnableLogging) {
+        try {
+            Add-Content -Path $script:ModuleConfig.LogPath -Value $logMessage -ErrorAction Stop
+        } catch {
+            Write-Error "Failed to write to log file: $_" -ErrorAction Continue
+        }
+    }
+}
+
+function Invoke-RestMethodWithRetry {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$Uri,
+        
+        [string]$Method = 'Get',
+        
+        [object]$Body = $null,
+        
+        [hashtable]$Headers = @{},
+        
+        [int]$MaxRetries = $script:ModuleConfig.RetryCount,
+        
+        [int]$RetryDelay = $script:ModuleConfig.RetryDelaySec
+    )
+    
+    $attempt = 0
+    $lastException = $null
+    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    
+    do {
+        $attempt++
+        $isLastAttempt = ($attempt -ge $MaxRetries)
+        
+        try {
+            $params = @{
+                Uri = $Uri
+                Method = $Method
+                Headers = $Headers
+                TimeoutSec = $script:ModuleConfig.TimeoutSec
+                ErrorAction = 'Stop'
+            }
+            
+            if ($Body) {
+                $params.Body = $Body
+                $params.ContentType = 'application/json'
+            }
+            
+            $response = Invoke-RestMethod @params
+            
+            # Update performance metrics
+            $script:PerformanceMetrics.TotalRequests++
+            $script:PerformanceMetrics.AverageResponseTimeMs = 
+                (($script:PerformanceMetrics.AverageResponseTimeMs * ($script:PerformanceMetrics.TotalRequests - 1)) + $stopwatch.ElapsedMilliseconds) / 
+                $script:PerformanceMetrics.TotalRequests
+            
+            return $response
+        }
+        catch [System.Net.WebException], [System.Net.Http.HttpRequestException] {
+            $lastException = $_.Exception
+            $statusCode = $null
+            
+            if ($_.Exception.Response) {
+                $statusCode = [int]$_.Exception.Response.StatusCode
+                $statusDescription = $_.Exception.Response.StatusDescription
+                Write-Log "Request failed with status $statusCode ($statusDescription) - Attempt $attempt/$MaxRetries" -Level Warning
+                
+                # Don't retry on client errors (4xx) except 408 (Timeout) and 429 (Too Many Requests)
+                if ($statusCode -ge 400 -and $statusCode -lt 500 -and $statusCode -notin @(408, 429)) {
+                    $isLastAttempt = $true
+                }
+            }
+            else {
+                Write-Log "Request failed: $($_.Exception.Message) - Attempt $attempt/$MaxRetries" -Level Warning
+            }
+            
+            $script:PerformanceMetrics.FailedRequests++
+            $script:PerformanceMetrics.LastError = $_.Exception.Message
+        }
+        catch {
+            $lastException = $_.Exception
+            Write-Log "Unexpected error: $($_.Exception.Message) - Attempt $attempt/$MaxRetries" -Level Error
+            $script:PerformanceMetrics.FailedRequests++
+            $script:PerformanceMetrics.LastError = $_.Exception.Message
+        }
+        
+        if (-not $isLastAttempt) {
+            Start-Sleep -Seconds $RetryDelay
+        }
+        
+    } while (-not $isLastAttempt)
+    
+    throw $lastException
+}
+
+function Get-CachedModels {
+    [CmdletBinding()]
+    param()
+    
+    $now = Get-Date
+    $shouldRefresh = (-not $script:Cache.Models) -or 
+                    (-not $script:Cache.LastModelUpdate) -or 
+                    (($now - $script:Cache.LastModelUpdate) -gt $script:Cache.CacheDuration)
+    
+    if ($shouldRefresh) {
+        try {
+            $script:Cache.Models = Get-AvailableModels -ErrorAction Stop
+            $script:Cache.LastModelUpdate = $now
+            Write-Log "Model cache refreshed. Found $($script:Cache.Models.Count) models." -Level Debug
+        }
+        catch {
+            Write-Log "Failed to refresh model cache: $_" -Level Warning
+            # Continue with stale data if available
+            if (-not $script:Cache.Models) {
+                throw "No cached models available and refresh failed: $_"
+            }
+        }
+    }
+    
+    return $script:Cache.Models
+}
+
+#endregion
+#Requires -Modules @{ ModuleName="PSSQLite"; ModuleVersion="1.1.0" }
+
+# Configuration
+$script:Config = @{
+    AIFactoryUrl = $env:AI_FACTORY_URL ?? "http://localhost:8000"
+    AIFactoryApiKey = $env:AI_FACTORY_API_KEY ?? $null
+    DefaultModel = "gpt-4-turbo"
+    CacheEnabled = $true
+    CacheTTL = (New-TimeSpan -Hours 1)
+}
+
+# Cache for storing API responses
+$script:ResponseCache = @{}
+
+function Initialize-AIFactory {
+    <#
+    .SYNOPSIS
+        Initializes the AI Factory integration with custom settings.
+    
+    .DESCRIPTION
+        Configures the AI Factory integration with custom settings including API URL and authentication.
+    
+    .PARAMETER Url
+        The base URL of the AI Factory API.
+    
+    .PARAMETER ApiKey
+        The API key for authenticating with the AI Factory.
+    
+    .PARAMETER DefaultModel
+        The default AI model to use for generation tasks.
+    
+    .EXAMPLE
+        Initialize-AIFactory -Url "https://ai-factory.example.com" -ApiKey "your-api-key"
+    #>
+    [CmdletBinding()]
+    param(
+        [string]$Url = $script:Config.AIFactoryUrl,
+        [string]$ApiKey = $script:Config.AIFactoryApiKey,
+        [string]$DefaultModel = $script:Config.DefaultModel,
+        [bool]$EnableCache = $script:Config.CacheEnabled,
+        [TimeSpan]$CacheTTL = $script:Config.CacheTTL
+    )
+    
+    $script:Config = @{
+        AIFactoryUrl = $Url.TrimEnd('/')
+        AIFactoryApiKey = $ApiKey
+        DefaultModel = $DefaultModel
+        CacheEnabled = $EnableCache
+        CacheTTL = $CacheTTL
+    }
+    
+    Write-Host "✅ AI Factory initialized with URL: $($script:Config.AIFactoryUrl)" -ForegroundColor Green
+}
+
+function Invoke-AIFactoryTask {
+    <#
+    .SYNOPSIS
+        Invokes a task on the AI Factory.
+    
+    .DESCRIPTION
+        Sends a request to the AI Factory to process a task with the specified parameters.
+    
+    .PARAMETER TaskType
+        The type of task to perform (e.g., 'info_extraction', 'summarization', 'classification', 'qa', 'code_generation').
+    
+    .PARAMETER Content
+        The content to process, which can be a string or a hashtable.
+    
+    .PARAMETER Model
+        The AI model to use for the task. Defaults to the configured default model.
+    
+    .PARAMETER Parameters
+        Additional parameters for the task as a hashtable.
+    
+    .PARAMETER Context
+        Context information to provide to the AI model as a hashtable.
+    
+    .PARAMETER Metadata
+        Additional metadata for the task as a hashtable.
+    
+    .EXAMPLE
+        Invoke-AIFactoryTask -TaskType "qa" -Content @{ question = "What is AI?" } -Model "gpt-4-turbo"
+    
+    .EXAMPLE
+        @{ question = "How to automate with PowerShell?" } | 
+            Invoke-AIFactoryTask -TaskType "qa" -Verbose
+    #>
+    [CmdletBinding()]
+    [OutputType([PSCustomObject])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('info_extraction', 'summarization', 'classification', 'qa', 'code_generation')]
+        [string]$TaskType,
+        
+        [Parameter(Mandatory = $true, ValueFromPipeline = $true)]
+        [object]$Content,
+        
+        [string]$Model = $script:Config.DefaultModel,
+        [hashtable]$Parameters = @{},
+        [hashtable]$Context = @{},
+        [hashtable]$Metadata = @{}
+    )
+    
+    begin {
+        # Check if initialization is needed
+        if (-not $script:Config.AIFactoryUrl) {
+            throw "AI Factory not initialized. Call Initialize-AIFactory first."
+        }
+        
+        $headers = @{
+            "Content-Type" = "application/json"
+        }
+        
+        if ($script:Config.AIFactoryApiKey) {
+            $headers["Authorization"] = "Bearer $($script:Config.AIFactoryApiKey)"
+        }
+        
+        $uri = "$($script:Config.AIFactoryUrl)/api/tasks"
+        
+        # Check cache if enabled
+        $useCache = $script:Config.CacheEnabled
+        $cacheKey = $null
+        
+        if ($useCache) {
+            $cacheKey = "task_${TaskType}_" + (Get-StringHash -InputObject @(
+                $Content, $Model, $Parameters, $Context, $Metadata
+            ) | Select-Object -First 1)
+            
+            if ($script:ResponseCache.ContainsKey($cacheKey)) {
+                $cached = $script:ResponseCache[$cacheKey]
+                $now = Get-Date
+                
+                if (($now - $cached.Timestamp) -le $script:Config.CacheTTL) {
+                    Write-Verbose "Using cached response for task: $TaskType"
+                    return $cached.Response
+                } else {
+                    $script:ResponseCache.Remove($cacheKey)
+                }
+            }
+        }
+    }
+    
+    process {
+        try {
+            # Prepare request body
+            $body = @{
+                task_type = $TaskType
+                content = $Content
+                model = $Model
+                parameters = $Parameters
+                context = $Context
+                metadata = $Metadata
+            } | ConvertTo-Json -Depth 10 -Compress
+            
+            Write-Verbose "Sending request to AI Factory: $uri"
+            $response = Invoke-RestMethod -Uri $uri -Method Post -Headers $headers -Body $body -ErrorAction Stop
+            
+            # Cache the response if successful
+            if ($useCache -and $cacheKey) {
+                $script:ResponseCache[$cacheKey] = @{
+                    Timestamp = Get-Date
+                    Response = $response
+                }
+            }
+            
+            return $response
+            
+        } catch {
+            $errorDetails = $_.Exception.Response
+            $statusCode = $errorDetails.StatusCode.value__
+            $errorMessage = $_.Exception.Message
+            
+            try {
+                $reader = [System.IO.StreamReader]::new($errorDetails.GetResponseStream())
+                $errorResponse = $reader.ReadToEnd() | ConvertFrom-Json -ErrorAction SilentlyContinue
+                $errorMessage = $errorResponse.error ?? $errorMessage
+            } catch {
+                # If we can't parse the error response, use the original message
+            }
+            
+            Write-Error "AI Factory request failed with status $statusCode`: $errorMessage" -ErrorAction Stop
+        }
+    }
+}
+
+function Get-RAGContext {
+    <#
+    .SYNOPSIS
+        Retrieves relevant context using the GLASP RAG system.
+    
+    .DESCRIPTION
+        Queries the GLASP RAG system to retrieve relevant context documents for the given query.
+    
+    .PARAMETER Query
+        The search query to find relevant context.
+    
+    .PARAMETER TopK
+        The maximum number of relevant documents to retrieve. Defaults to 3.
+    
+    .EXAMPLE
+        Get-RAGContext -Query "AI automation best practices" -TopK 5
+    
+    .EXAMPLE
+        "How to use PowerShell for automation" | Get-RAGContext
+    #>
+    [CmdletBinding()]
+    [OutputType([PSCustomObject[]])]
+    param(
+        [Parameter(Mandatory = $true, ValueFromPipeline = $true)]
+        [string]$Query,
+        
+        [int]$TopK = 3
+    )
+    
+    begin {
+        if (-not $script:Config.AIFactoryUrl) {
+            throw "AI Factory not initialized. Call Initialize-AIFactory first."
+        }
+        
+        $headers = @{
+            "Content-Type" = "application/json"
+        }
+        
+        if ($script:Config.AIFactoryApiKey) {
+            $headers["Authorization"] = "Bearer $($script:Config.AIFactoryApiKey)"
+        }
+        
+        $baseUri = $script:Config.AIFactoryUrl
+    }
+    
+    process {
+        try {
+            $uri = "${baseUri}/api/rag/retrieve?query=[uri]::EscapeDataString($Query)&top_k=$TopK"
+            
+            Write-Verbose "Retrieving RAG context for query: $Query"
+            $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $headers -ErrorAction Stop
+            
+            return $response.results
+            
+        } catch {
+            Write-Error "Failed to retrieve RAG context: $_" -ErrorAction Continue
+            return @()
+        }
+    }
+}
+
+function Invoke-RAGGeneration {
+    <#
+    .SYNOPSIS
+        Generates text using RAG-augmented generation.
+    
+    .DESCRIPTION
+        Uses the GLASP RAG system to retrieve relevant context and generates text using the specified AI model.
+    
+    .PARAMETER Prompt
+        The input prompt for generation.
+    
+    .PARAMETER ContextQueries
+        One or more queries to retrieve relevant context.
+    
+    .PARAMETER Model
+        The AI model to use for generation. Defaults to the configured default model.
+    
+    .PARAMETER MaxTokens
+        The maximum number of tokens to generate. Defaults to 2000.
+    
+    .PARAMETER Temperature
+        The temperature for generation. Lower values make output more deterministic. Defaults to 0.7.
+    
+    .PARAMETER TopK
+        The number of relevant documents to retrieve per query. Defaults to 3.
+    
+    .EXAMPLE
+        Invoke-RAGGeneration -Prompt "Explain AI automation" -ContextQueries "AI automation", "machine learning automation"
+    
+    .EXAMPLE
+        "How to implement a chatbot?" | Invoke-RAGGeneration -Model "gpt-4-turbo" -Verbose
+    #>
+    [CmdletBinding()]
+    [OutputType([PSCustomObject])]
+    param(
+        [Parameter(Mandatory = $true, ValueFromPipeline = $true)]
+        [string]$Prompt,
+        
+        [string[]]$ContextQueries = @(),
+        [string]$Model = $script:Config.DefaultModel,
+        [int]$MaxTokens = 2000,
+        [double]$Temperature = 0.7,
+        [int]$TopK = 3
+    )
+    
+    begin {
+        if (-not $script:Config.AIFactoryUrl) {
+            throw "AI Factory not initialized. Call Initialize-AIFactory first."
+        }
+        
+        # If no context queries provided, use the prompt as a query
+        if ($ContextQueries.Count -eq 0) {
+            $ContextQueries = @($Prompt)
+        }
+    }
+    
+    process {
+        $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+        
+        try {
+            # Retrieve relevant context (parallel processing for multiple queries)
+            $contextDocs = @()
+            $contextQueries = if ($ContextQueries.Count -eq 0) { @($Prompt) } else { $ContextQueries }
+            
+            # Process context queries in parallel if there are many
+            if ($contextQueries.Count -gt 1) {
+                $contextJobs = $contextQueries | ForEach-Object -ThrottleLimit 5 -Parallel {
+                    $query = $_
+                    try {
+                        $context = Get-RAGContext -Query $query -TopK $using:TopK -ErrorAction Stop
+                        return $context
+                    } catch {
+                        Write-Log "Failed to get context for query: $query" -Level Warning
+                        return $null
+                    }
+                }
+                $contextDocs = $contextJobs | Where-Object { $_ -ne $null }
+            } 
+            else {
+                # Single query, no need for parallel processing
+                foreach ($query in $contextQueries) {
+                    try {
+                        $context = Get-RAGContext -Query $query -TopK $TopK -ErrorAction Stop
+                        $contextDocs += $context
+                    } catch {
+                        Write-Log "Failed to get context for query: $query" -Level Warning
+                    }
+                }
+            }
+            
+            # Prepare the prompt with context (optimized string building)
+            $contextStr = if ($contextDocs.Count -gt 0) {
+                $sb = [System.Text.StringBuilder]::new()
+                $sb.AppendLine("Use the following context to answer the question or complete the task.")
+                $sb.AppendLine("If the context doesn't contain relevant information, use your general knowledge.")
+                $sb.AppendLine()
+                $sb.AppendLine("Context:")
+                
+                foreach ($doc in $contextDocs) {
+                    $sb.AppendLine("[Document]")
+                    $sb.AppendLine($doc.content)
+                    $sb.AppendLine()
+                }
+                
+                $sb.AppendLine()
+                $sb.AppendLine("Task: $Prompt")
+                $sb.ToString()
+            } else {
+                $Prompt
+            }
+            
+            # Generate response using the AI model with optimized parameters
+            $taskParams = @{
+                TaskType = "qa"
+                Content = @{
+                    prompt = $contextStr
+                }
+                Model = $Model
+                Parameters = @{
+                    max_tokens = $MaxTokens
+                    temperature = [Math]::Min([Math]::Max($Temperature, 0), 2.0)  # Clamp between 0 and 2
+                    top_p = 0.95
+                    frequency_penalty = 0.1
+                    presence_penalty = 0.1
+                }
+                TimeoutSec = $script:ModuleConfig.TimeoutSec
+            }
+            
+            $response = Invoke-AIFactoryTask @taskParams -ErrorAction Stop
+            $stopwatch.Stop()
+            
+            # Prepare result object with enhanced metadata
+            $result = [PSCustomObject]@{
+                Success = $true
+                GeneratedText = $response.result.text.Trim()
+                ContextDocuments = $contextDocs
+                Metadata = @{
+                    Model = $Model
+                    ContextQueries = $contextQueries
+                    ContextDocumentsCount = $contextDocs.Count
+                    ProcessingTimeMs = [math]::Round($stopwatch.ElapsedMilliseconds, 2)
+                    TokensGenerated = $response.usage.completion_tokens
+                    TokensTotal = $response.usage.total_tokens
+                    Timestamp = [DateTime]::UtcNow.ToString('o')
+                }
+            }
+            
+            return $result
+            
+        } catch {
+            Write-Error "RAG generation failed: $_" -ErrorAction Continue
+            
+            return [PSCustomObject]@{
+                Success = $false
+                Error = $_.Exception.Message
+                Metadata = @{
+                    Model = $Model
+                    ContextQueries = $ContextQueries
+                }
+            }
+        }
+    }
+}
+
+# Helper function to generate a hash from an object
+function Get-StringHash {
+    [CmdletBinding()]
+    param(
+        [Parameter(ValueFromPipeline = $true)]
+        [object]$InputObject
+    )
+    
+    process {
+        $json = $InputObject | ConvertTo-Json -Depth 10 -Compress
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+        $hash = [System.Security.Cryptography.SHA256]::Create().ComputeHash($bytes)
+        return [BitConverter]::ToString($hash).Replace('-', '').ToLower()
+    }
+}
+
+# Export public functions
+Export-ModuleMember -Function @(
+    'Initialize-AIFactory',
+    'New-Conversation',
+    'Get-Conversation',
+    'Remove-Conversation',
+    'Add-ConversationMessage',
+    'Invoke-AIFactoryChat',
+    'Invoke-AIFactoryTask',
+    'Get-RAGContext',
+    'Invoke-RAGGeneration'
+)

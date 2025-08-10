@@ -1,0 +1,153 @@
+{
+    "version": "1.1",
+    "accounts": [
+        {
+            "name": "xy_drive_3",
+            "credentials_file": "credentials_xy3.json",
+            "token_file": "token_xy3.json",
+            "description": "XYDrive 3 - Main Storage",
+            "priority": 1,
+            "quota_warning_threshold": 0.8
+        },
+        {
+            "name": "xy_drive_4",
+            "credentials_file": "credentials_xy4.json",
+            "token_file": "token_xy4.json",
+            "description": "XYDrive 4 - Backup Storage",
+            "priority": 2,
+            "quota_warning_threshold": 0.8
+        }
+    ],
+    "default_account": "xy_drive_3",
+    "sync_folders": [
+        {
+            "name": "xy3_documents",
+            "local_path": "./data/sync/xy3/documents",
+            "drive_folder_id": "FOLDER_ID_XY3_DOCS",
+            "account": "xy_drive_3",
+            "sync_interval": 3600,
+            "file_patterns": ["*.pdf", "*.docx", "*.xlsx", "*.pptx"],
+            "exclude_patterns": ["*.tmp"],
+            "max_file_size_mb": 100,
+            "retry_attempts": 3,
+            "retry_delay_seconds": 5
+        },
+        {
+            "name": "xy3_images",
+            "local_path": "./data/sync/xy3/images",
+            "drive_folder_id": "FOLDER_ID_XY3_IMAGES",
+            "account": "xy_drive_3",
+            "sync_interval": 7200,
+            "file_patterns": ["*.jpg", "*.jpeg", "*.png", "*.gif"],
+            "max_file_size_mb": 50,
+            "compress_images": true,
+            "compression_quality": 85
+        },
+        {
+            "name": "xy4_backup",
+            "local_path": "./data/sync/xy4/backup",
+            "drive_folder_id": "FOLDER_ID_XY4_BACKUP",
+            "account": "xy_drive_4",
+            "sync_interval": 86400,
+            "backup_retention_days": 30,
+            "verify_backup_integrity": true
+        },
+        {
+            "name": "xy4_archives",
+            "local_path": "./data/sync/xy4/archives",
+            "drive_folder_id": "FOLDER_ID_XY4_ARCHIVES",
+            "account": "xy_drive_4",
+            "sync_interval": 43200,
+            "file_patterns": ["*.zip", "*.rar", "*.7z"],
+            "extract_archives": true,
+            "delete_after_extraction": false
+        }
+    ],
+    "system_service": {
+        "enabled": true,
+        "service_name": "ai_factory_drive_sync",
+        "display_name": "AI Factory Drive Sync Service",
+        "description": "Manages synchronization between local files and Google Drive accounts",
+        "startup_type": "automatic",
+        "log_level": "INFO",
+        "log_retention_days": 7,
+        "max_log_size_mb": 10,
+        "watchdog": {
+            "enabled": true,
+            "check_interval_seconds": 60,
+            "max_restarts": 3
+        },
+        "notifications": {
+            "email": {
+                "enabled": false,
+                "smtp_server": "smtp.example.com",
+                "smtp_port": 587,
+                "username": "user@example.com",
+                "password_env": "SMTP_PASSWORD",
+                "from_address": "noreply@example.com",
+                "to_addresses": ["admin@example.com"],
+                "on_errors": true,
+                "on_sync_complete": false,
+                "on_quota_warning": true
+            },
+            "webhook": {
+                "enabled": false,
+                "url": "https://example.com/webhook",
+                "secret_env": "WEBHOOK_SECRET",
+                "events": ["error", "quota_warning", "sync_complete"]
+            }
+        }
+    },
+    "file_processing": {
+        "pipelines": [
+            {
+                "name": "document_ocr",
+                "description": "Extract text from images and PDFs using OCR",
+                "file_patterns": ["*.jpg", "*.jpeg", "*.png", "*.pdf"],
+                "source_folders": ["xy3_documents", "xy3_images"],
+                "output_format": "txt",
+                "keep_original": true,
+                "move_processed_to": "xy4_archives/processed",
+                "enable_parallel_processing": true,
+                "max_workers": 4
+            },
+            {
+                "name": "csv_processing",
+                "description": "Process CSV files with pandas",
+                "file_patterns": ["*.csv"],
+                "source_folders": ["xy3_documents"],
+                "operations": [
+                    {
+                        "name": "clean_data",
+                        "type": "pandas",
+                        "script": "df.dropna(inplace=True)"
+                    },
+                    {
+                        "name": "add_timestamp",
+                        "type": "pandas",
+                        "script": "df['processed_at'] = pd.Timestamp.now()"
+                    }
+                ],
+                "output_format": "parquet",
+                "compression": "gzip"
+            }
+        ]
+    },
+    "monitoring": {
+        "prometheus": {
+            "enabled": true,
+            "port": 9091,
+            "metrics_path": "/metrics"
+        },
+        "health_check": {
+            "enabled": true,
+            "port": 8080,
+            "endpoint": "/health"
+        },
+        "sentry": {
+            "enabled": false,
+            "dsn_env": "SENTRY_DSN",
+            "environment": "production"
+        }
+    }
+}
