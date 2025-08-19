@@ -3,6 +3,7 @@ Database models for AI Automation Factory.
 
 This module defines the SQLAlchemy models for the application.
 """
+import asyncio
 from datetime import datetime
 from enum import Enum as PyEnum
 from typing import List, Optional, Dict, Any
@@ -19,7 +20,9 @@ from sqlalchemy import (
     Enum,
     Table,
     func,
-    event
+    event,
+    Float,
+    inspect
 )
 from sqlalchemy.orm import relationship, Mapped, mapped_column
 from sqlalchemy.ext.asyncio import AsyncAttrs
@@ -55,7 +58,7 @@ class User(AsyncAttrs, Base):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     is_verified: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), onupdate=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     last_login: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     
     # Relationships
@@ -121,6 +124,7 @@ class Task(AsyncAttrs, Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     task_id: Mapped[str] = mapped_column(String(36), unique=True, index=True, nullable=False)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
+    task_type: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     description: Mapped[Optional[str]] = mapped_column(Text)
     status: Mapped[TaskStatus] = mapped_column(Enum(TaskStatus), default=TaskStatus.PENDING, nullable=False)
     priority: Mapped[TaskPriority] = mapped_column(Enum(TaskPriority), default=TaskPriority.NORMAL, nullable=False)
@@ -213,6 +217,24 @@ class APILog(AsyncAttrs, Base):
     
     def __repr__(self):
         return f"<APILog(id={self.id}, {self.method} {self.path} {self.status_code})>"
+
+class Feedback(AsyncAttrs, Base):
+    """Feedback model for user ratings and comments."""
+    __tablename__ = 'feedback'
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    type: Mapped[str] = mapped_column(String(50), nullable=False)
+    content: Mapped[Dict[str, Any]] = mapped_column(JSON, nullable=False)
+    task_id: Mapped[Optional[str]] = mapped_column(String(36), ForeignKey('tasks.task_id'), nullable=True)
+    user_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey('users.id'), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    # Relationships
+    task: Mapped[Optional['Task']] = relationship('Task')
+    user: Mapped[Optional['User']] = relationship('User')
+
+    def __repr__(self):
+        return f"<Feedback(id={self.id}, type='{self.type}')>"
 
 # Event listeners
 @event.listens_for(Task, 'after_insert')

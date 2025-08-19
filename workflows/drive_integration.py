@@ -14,6 +14,7 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 import io
 
@@ -79,32 +80,36 @@ class DriveManager:
         if not account:
             return False
             
+        # NOTE: The current authentication flow uses `run_local_server`, which is suitable
+        # for local development but will not work in a headless production environment.
+        # For production, consider using a different OAuth 2.0 flow (e.g., web server flow).
         try:
             creds = None
-            
-            # Load existing credentials if they exist
             if account.token_path.exists():
-                creds = Credentials.from_authorized_user_file(
-                    str(account.token_path), SCOPES)
-            
-            # If there are no (valid) credentials, let the user log in
+                creds = await asyncio.to_thread(
+                    Credentials.from_authorized_user_file, str(account.token_path), SCOPES
+                )
+
             if not creds or not creds.valid:
                 if creds and creds.expired and creds.refresh_token:
-                    creds.refresh(Request())
+                    await asyncio.to_thread(creds.refresh, Request())
                 else:
-                    flow = InstalledAppFlow.from_client_secrets_file(
-                        str(account.credentials_path), SCOPES)
-                    creds = flow.run_local_server(port=0)
+                    flow = await asyncio.to_thread(
+                        InstalledAppFlow.from_client_secrets_file, str(account.credentials_path), SCOPES
+                    )
+                    creds = await asyncio.to_thread(flow.run_local_server, port=0)
                 
-                # Save the credentials for the next run
-                with open(account.token_path, 'w') as token:
-                    token.write(creds.to_json())
-            
+                async with aiofiles.open(account.token_path, 'w') as token:
+                    await token.write(creds.to_json())
+
             account.credentials = creds
-            account.service = build('drive', 'v3', credentials=creds)
+            account.service = await asyncio.to_thread(build, 'drive', 'v3', credentials=creds)
             logger.info(f"Authenticated with Google Drive account: {account.name}")
             return True
             
+        except HttpError as e:
+            logger.error(f"An API error occurred for {account.name}: {e}")
+            return False
         except Exception as e:
             logger.error(f"Authentication failed for {account.name}: {e}")
             return False
@@ -141,15 +146,20 @@ class DriveManager:
                 resumable=True
             )
             
-            file = account.service.files().create(
-                body=file_metadata,
-                media_body=media,
-                fields='id, name, mimeType, webViewLink, webContentLink, size'
-            ).execute()
+            file = await asyncio.to_thread(
+                account.service.files().create(
+                    body=file_metadata,
+                    media_body=media,
+                    fields='id, name, mimeType, webViewLink, webContentLink, size'
+                ).execute
+            )
             
-            logger.info(f"Uploaded {local_path} to {account.name}")
+            logger.info(f"Uploaded {local_path} to {account.name}: {file.get('name')} ({file.get('id')})")
             return file
             
+        except HttpError as e:
+            logger.error(f"An API error occurred while uploading {local_path} to {account.name}: {e}")
+            return None
         except Exception as e:
             logger.error(f"Error uploading {local_path} to {account.name}: {e}")
             return None
@@ -167,20 +177,21 @@ class DriveManager:
             local_path.parent.mkdir(parents=True, exist_ok=True)
             
             request = account.service.files().get_media(fileId=file_id)
+            
             fh = io.BytesIO()
-            downloader = MediaIoBaseDownload(fh, request)
+            await asyncio.to_thread(
+                MediaIoBaseDownload(fh, request).next_chunk
+            )
             
-            done = False
-            while not done:
-                status, done = downloader.next_chunk()
-                logger.info(f"Download {int(status.progress() * 100)}%")
-            
-            with open(local_path, 'wb') as f:
-                f.write(fh.getvalue())
+            async with aiofiles.open(local_path, 'wb') as f:
+                await f.write(fh.getvalue())
                 
             logger.info(f"Downloaded {file_id} to {local_path}")
             return True
             
+        except HttpError as e:
+            logger.error(f"An API error occurred while downloading {file_id} from {account.name}: {e}")
+            return False
         except Exception as e:
             logger.error(f"Error downloading {file_id} from {account.name}: {e}")
             return False
@@ -197,12 +208,14 @@ class DriveManager:
             page_token = None
             
             while True:
-                response = account.service.files().list(
-                    q=query,
-                    spaces='drive',
-                    fields='nextPageToken, files(id, name, mimeType, size, modifiedTime)',
-                    pageToken=page_token
-                ).execute()
+                response = await asyncio.to_thread(
+                    account.service.files().list(
+                        q=query,
+                        spaces='drive',
+                        fields='nextPageToken, files(id, name, mimeType, size, modifiedTime)',
+                        pageToken=page_token
+                    ).execute
+                )
                 
                 results.extend(response.get('files', []))
                 page_token = response.get('nextPageToken')
@@ -210,9 +223,12 @@ class DriveManager:
                 if not page_token:
                     break
                     
-            logger.info(f"Found {len(results)} files in {account.name}")
+            logger.info(f"Found {len(results)} files in {account.name} matching query '{query}'")
             return results
             
+        except HttpError as e:
+            logger.error(f"An API error occurred while listing files in {account.name}: {e}")
+            return []
         except Exception as e:
             logger.error(f"Error listing files in {account.name}: {e}")
             return []

@@ -6,9 +6,12 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import List, Dict, Any, Optional, Callable, Awaitable
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 import logging
 from loguru import logger
+from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession
+
+from models.models import Task as TaskModel
 
 class TaskStatus(str, Enum):
     PENDING = "pending"
@@ -40,9 +43,11 @@ class Task:
         priority: TaskPriority = TaskPriority.NORMAL,
         max_retries: int = 3,
         dependencies: Optional[List['Task']] = None,
+        task_type: Optional[str] = None,
     ):
         self.task_id = task_id
         self.func = func
+        self.task_type = task_type
         self.args = args or ()
         self.kwargs = kwargs or {}
         self.priority = priority
@@ -51,14 +56,14 @@ class Task:
         self.status = TaskStatus.PENDING
         self.result: Optional[TaskResult] = None
         self.retry_count = 0
-        self.created_at = datetime.utcnow()
+        self.created_at = datetime.now(timezone.utc)
         self.started_at: Optional[datetime] = None
         self.completed_at: Optional[datetime] = None
         self.logger = logger.bind(task_id=task_id)
 
     async def execute(self) -> TaskResult:
         self.status = TaskStatus.RUNNING
-        self.started_at = datetime.utcnow()
+        self.started_at = datetime.now(timezone.utc)
         
         # Check dependencies first
         for dep in self.dependencies:
@@ -78,7 +83,7 @@ class Task:
                 self.logger.info(f"Executing task {self.task_id} (attempt {self.retry_count + 1}/{self.max_retries + 1})")
                 output = await self.func(*self.args, **self.kwargs)
                 self.status = TaskStatus.COMPLETED
-                self.completed_at = datetime.utcnow()
+                self.completed_at = datetime.now(timezone.utc)
                 self.result = TaskResult(success=True, output=output)
                 return self.result
                 
@@ -96,7 +101,7 @@ class Task:
                     await asyncio.sleep(retry_delay)
                 else:
                     self.status = TaskStatus.FAILED
-                    self.completed_at = datetime.utcnow()
+                    self.completed_at = datetime.now(timezone.utc)
                     self.result = TaskResult(
                         success=False,
                         output=None,
@@ -109,20 +114,37 @@ class Task:
                     return self.result
 
 class TaskManager:
-    def __init__(self, max_concurrent_tasks: int = 5):
+    def __init__(
+        self,
+        max_concurrent_tasks: int = 5,
+        db_session_factory: Optional[async_sessionmaker[AsyncSession]] = None,
+    ):
         self.tasks: Dict[str, Task] = {}
         self.task_queue = asyncio.PriorityQueue()
         self.max_concurrent_tasks = max_concurrent_tasks
         self.semaphore = asyncio.Semaphore(max_concurrent_tasks)
+        self.db_session_factory = db_session_factory
         self.logger = logger.bind(component="TaskManager")
         self._is_running = False
         self._task_executors = set()
 
-    def add_task(self, task: Task) -> str:
+    async def add_task(self, task: Task) -> str:
         """Add a task to the manager and return its ID."""
         if task.task_id in self.tasks:
             raise ValueError(f"Task with ID {task.task_id} already exists")
-            
+
+        if self.db_session_factory:
+            async with self.db_session_factory() as session:
+                task_model = TaskModel(
+                    task_id=task.task_id,
+                    name=task.task_type or "Untitled Task",
+                    task_type=task.task_type,
+                    status=task.status,
+                    priority=task.priority,
+                )
+                session.add(task_model)
+                await session.commit()
+
         self.tasks[task.task_id] = task
         # Priority queue uses a tuple where first element is the priority (lower is higher priority)
         self.task_queue.put_nowait((task.priority.value, task.task_id))

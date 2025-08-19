@@ -7,9 +7,11 @@ with sensible defaults.
 import os
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Union
-from pydantic import BaseSettings, Field, validator, HttpUrl, PostgresDsn
+from pydantic import Field, HttpUrl, field_validator, model_validator
+from pydantic_settings import BaseSettings
 from enum import Enum
 from loguru import logger
+import logging
 
 class EnvironmentType(str, Enum):
     """Application environment types."""
@@ -48,8 +50,8 @@ class Settings(BaseSettings):
     CORS_HEADERS: List[str] = ["*"]
     
     # Database settings
-    DATABASE_URL: Optional[PostgresDsn] = "sqlite+aiosqlite:///./ai_factory.db"
-    TEST_DATABASE_URL: Optional[PostgresDsn] = "sqlite+aiosqlite:///./test_ai_factory.db"
+    DATABASE_URL: str = "sqlite+aiosqlite:///./ai_factory.db"
+    TEST_DATABASE_URL: str = "sqlite+aiosqlite:///./test_ai_factory.db"
     
     # File storage
     BASE_DIR: Path = Path(__file__).parent
@@ -86,40 +88,40 @@ class Settings(BaseSettings):
     API_KEY_HEADER: str = "X-API-Key"
     RATE_LIMIT: str = "100/minute"
     
-    class Config:
-        """Pydantic config."""
-        env_file = ".env"
-        env_file_encoding = "utf-8"
-        case_sensitive = True
-        
-    @validator("DATA_DIR", "UPLOAD_DIR", "OUTPUT_DIR", "TEMP_DIR", pre=True)
-    def create_data_dirs(cls, v: Path) -> Path:
+    model_config = {
+        "env_file": ".env",
+        "env_file_encoding": "utf-8",
+        "case_sensitive": True,
+    }
+
+    @field_validator("DATA_DIR", "UPLOAD_DIR", "OUTPUT_DIR", "TEMP_DIR", mode="before")
+    def create_data_dirs(cls, v: Any) -> Path:
         """Create data directories if they don't exist."""
-        v.mkdir(parents=True, exist_ok=True)
-        return v
-    
-    @validator("LOG_FILE", pre=True)
-    def create_log_file(cls, v: Optional[Path], values: Dict[str, Any]) -> Optional[Path]:
-        """Create log file directory if it doesn't exist."""
-        if v is not None:
-            v.parent.mkdir(parents=True, exist_ok=True)
-        return v
-    
-    @validator("GOOGLE_DRIVE_CREDENTIALS_FILE", "GOOGLE_DRIVE_TOKEN_FILE", pre=True)
-    def resolve_google_drive_paths(cls, v: Optional[Union[str, Path]], values: Dict[str, Any]) -> Optional[Path]:
-        """Resolve Google Drive file paths."""
-        if v is None:
-            return None
-        
         path = Path(v)
-        if not path.is_absolute():
-            base_dir = values.get("BASE_DIR", Path.cwd())
-            path = base_dir / path
-            
-        if path.exists() and "CREDENTIALS" in path.name and path.suffix == ".json":
-            return path
-            
-        return None
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    @model_validator(mode="after")
+    def handle_paths(self) -> "Settings":
+        # log file
+        if self.LOG_FILE is not None:
+            self.LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+        # google drive credentials
+        if self.GOOGLE_DRIVE_CREDENTIALS_FILE is not None:
+            path = Path(self.GOOGLE_DRIVE_CREDENTIALS_FILE)
+            if not path.is_absolute():
+                path = self.BASE_DIR / path
+            if path.exists() and "credentials" in path.name and path.suffix == ".json":
+                self.GOOGLE_DRIVE_CREDENTIALS_FILE = path
+
+        if self.GOOGLE_DRIVE_TOKEN_FILE is not None:
+            path = Path(self.GOOGLE_DRIVE_TOKEN_FILE)
+            if not path.is_absolute():
+                path = self.BASE_DIR / path
+            self.GOOGLE_DRIVE_TOKEN_FILE = path
+
+        return self
     
     def configure_logging(self) -> None:
         """Configure logging based on settings."""
