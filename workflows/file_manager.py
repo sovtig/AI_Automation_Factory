@@ -4,10 +4,12 @@ Automated File Management System for AI Automation Factory
 Handles file operations asynchronously with support for various file types
 and automated processing pipelines.
 """
+
 import os
 import shutil
 import zipfile
 import hashlib
+import tempfile
 from pathlib import Path
 from typing import Optional, Union, List, Dict, Any, AsyncGenerator
 from datetime import datetime
@@ -17,6 +19,7 @@ import aiofiles
 import aiofiles.os
 from dataclasses import dataclass
 from enum import Enum
+from concurrent.futures import ThreadPoolExecutor  # <-- FIXED: Added this import
 
 class FileType(Enum):
     """Supported file types."""
@@ -35,63 +38,6 @@ class FileMetadata:
     file_type: FileType
 
 class FileManager:
-    """Automated file management with async support."""
-    
-    def __init__(self, base_dir: Optional[Union[str, Path]] = None):
-        """Initialize with optional base directory."""
-        self.base_dir = Path(base_dir or os.getcwd()).resolve()
-        self.loop = asyncio.get_event_loop()
-        logger.info(f"FileManager ready at {self.base_dir}")
-    
-    def _resolve_path(self, path: Union[str, Path]) -> Path:
-        """Resolve path relative to base directory."""
-        path = Path(path)
-        return (self.base_dir / path).resolve() if not path.is_absolute() else path
-    
-    async def ensure_dir(self, path: Union[str, Path]) -> Path:
-        """Ensure directory exists."""
-        path = self._resolve_path(path)
-        await aiofiles.os.makedirs(path, exist_ok=True)
-        return path
-    
-    async def read_file(self, path: Union[str, Path], binary: bool = False) -> Union[str, bytes]:
-        """Read file content."""
-        path = self._resolve_path(path)
-        mode = 'rb' if binary else 'r'
-        async with aiofiles.open(path, mode) as f:
-            return await f.read()
-    
-    async def write_file(self, path: Union[str, Path], content: Union[str, bytes], 
-                        binary: bool = False) -> Path:
-        """Write content to file."""
-        path = self._resolve_path(path)
-        await self.ensure_dir(path.parent)
-        mode = 'wb' if binary or isinstance(content, bytes) else 'w'
-        async with aiofiles.open(path, mode) as f:
-            await f.write(content)
-        return path
-    
-    async def process_files(self, input_dir: str, pattern: str = '*', 
-                          processor: callable = None) -> List[Dict]:
-        """Process files matching pattern with given processor."""
-        input_dir = self._resolve_path(input_dir)
-        results = []
-        
-        for file_path in input_dir.glob(pattern):
-            if not await aiofiles.os.path.isfile(file_path):
-                continue
-                
-            try:
-                content = await self.read_file(file_path)
-                if processor:
-                    result = await processor(content) if asyncio.iscoroutinefunction(processor) \
-                             else await self.loop.run_in_executor(None, processor, content)
-                    results.append({"file": str(file_path), "result": result})
-            except Exception as e:
-                logger.error(f"Error processing {file_path}: {e}")
-                results.append({"file": str(file_path), "error": str(e)})
-                
-        return results
     """Manages file operations with support for compression and Google Drive integration."""
     
     def __init__(self, base_dir: str = "./data"):
@@ -110,40 +56,20 @@ class FileManager:
         for directory in [self.base_dir, self.working_dir, self.output_dir, self.temp_dir]:
             directory.mkdir(parents=True, exist_ok=True)
             
-        self.executor = ThreadPoolExecutor(max_workers=4)
+        self.executor = ThreadPoolExecutor(max_workers=4)  # <-- This will now work!
         self.logger = logger.bind(component="FileManager")
         
-    async def create_file(self, content: str, filename: str, subdir: str = "") -> Path:
-        """
-        Create a new file with the given content.
-        
-        Args:
-            content: Content to write to the file
-            filename: Name of the file to create
-            subdir: Optional subdirectory within the working directory
-            
-        Returns:
-            Path to the created file
-        """
-        target_dir = self.working_dir / subdir
-        target_dir.mkdir(parents=True, exist_ok=True)
-        
-        file_path = target_dir / filename
-        
-        def _write_file():
-            with open(file_path, 'w', encoding='utf-8') as f:
-                f.write(content)
-            return file_path
-            
-        try:
-            loop = asyncio.get_running_loop()
-            result = await loop.run_in_executor(self.executor, _write_file)
-            self.logger.info(f"Created file: {result}")
-            return result
-        except Exception as e:
-            self.logger.error(f"Error creating file {file_path}: {str(e)}")
-            raise
-            
+    def _resolve_path(self, path: Union[str, Path]) -> Path:
+        """Resolve path relative to base directory."""
+        path = Path(path)
+        return (self.base_dir / path).resolve() if not path.is_absolute() else path
+
+    async def ensure_dir(self, path: Union[str, Path]) -> Path:
+        """Ensure directory exists."""
+        path = self._resolve_path(path)
+        await aiofiles.os.makedirs(path, exist_ok=True)
+        return path
+
     async def read_file(self, filepath: Union[str, Path], binary: bool = False) -> Union[str, bytes]:
         """
         Read content from a file.
@@ -174,6 +100,69 @@ class FileManager:
         except Exception as e:
             self.logger.error(f"Error reading file {filepath}: {str(e)}")
             raise
+
+    async def write_file(self, path: Union[str, Path], content: Union[str, bytes], 
+                        binary: bool = False) -> Path:
+        """Write content to file."""
+        path = self._resolve_path(path)
+        await self.ensure_dir(path.parent)
+        mode = 'wb' if binary or isinstance(content, bytes) else 'w'
+        async with aiofiles.open(path, mode) as f:
+            await f.write(content)
+        return path
+
+    async def create_file(self, content: str, filename: str, subdir: str = "") -> Path:
+        """
+        Create a new file with the given content.
+        
+        Args:
+            content: Content to write to the file
+            filename: Name of the file to create
+            subdir: Optional subdirectory within the working directory
+            
+        Returns:
+            Path to the created file
+        """
+        target_dir = self.working_dir / subdir
+        target_dir.mkdir(parents=True, exist_ok=True)
+        
+        file_path = target_dir / filename
+        
+        def _write_file():
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+            return file_path
+            
+        try:
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(self.executor, _write_file)
+            self.logger.info(f"Created file: {result}")
+            return result
+        except Exception as e:
+            self.logger.error(f"Error creating file {file_path}: {str(e)}")
+            raise
+
+    async def process_files(self, input_dir: str, pattern: str = '*', 
+                          processor: callable = None) -> List[Dict]:
+        """Process files matching pattern with given processor."""
+        input_dir = self._resolve_path(input_dir)
+        results = []
+        
+        for file_path in input_dir.glob(pattern):
+            if not await aiofiles.os.path.isfile(file_path):
+                continue
+                
+            try:
+                content = await self.read_file(file_path)
+                if processor:
+                    result = await processor(content) if asyncio.iscoroutinefunction(processor) \
+                             else await asyncio.get_running_loop().run_in_executor(None, processor, content)
+                    results.append({"file": str(file_path), "result": result})
+            except Exception as e:
+                logger.error(f"Error processing {file_path}: {e}")
+                results.append({"file": str(file_path), "error": str(e)})
+                
+        return results
             
     async def create_archive(self, source_paths: List[Union[str, Path]], 
                            archive_name: str, format: str = 'zip') -> Path:
