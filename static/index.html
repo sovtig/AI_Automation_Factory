@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HyperBot Next-Gen AI</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .chat-container {
+            background: white;
+            border-radius: 10px;
+            padding: 20px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        .chat-messages {
+            height: 400px;
+            overflow-y: auto;
+            border: 1px solid #ddd;
+            padding: 10px;
+            margin-bottom: 20px;
+            background: #fafafa;
+        }
+        .message {
+            margin-bottom: 10px;
+            padding: 8px;
+            border-radius: 5px;
+        }
+        .user-message {
+            background: #007bff;
+            color: white;
+            text-align: right;
+        }
+        .bot-message {
+            background: #e9ecef;
+            color: black;
+        }
+        .input-container {
+            display: flex;
+            gap: 10px;
+        }
+        input[type="text"] {
+            flex: 1;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+        }
+        button {
+            padding: 10px 20px;
+            background: #28a745;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+        }
+        button:hover {
+            background: #218838;
+        }
+        .user-id {
+            margin-bottom: 20px;
+        }
+        .user-id input {
+            width: 200px;
+        }
+    </style>
+</head>
+<body>
+    <h1>HyperBot Next-Gen AI</h1>
+    <div class="chat-container">
+        <div class="user-id">
+            <label for="userId">User ID:</label>
+            <input type="text" id="userId" placeholder="Enter your user ID" value="default_user">
+        </div>
+        <div id="chat-messages" class="chat-messages"></div>
+        <div class="input-container">
+            <input type="text" id="message-input" placeholder="Type your message..." onkeypress="handleKeyPress(event)">
+            <button onclick="sendMessage()">Send</button>
+        </div>
+    </div>
+
+    <script>
+        const API_KEY = 'quantum-key-secure'; // In production, this should be securely handled
+
+        function addMessage(message, isUser = false) {
+            const messagesDiv = document.getElementById('chat-messages');
+            const messageDiv = document.createElement('div');
+            messageDiv.className = `message ${isUser ? 'user-message' : 'bot-message'}`;
+            messageDiv.textContent = message;
+            messagesDiv.appendChild(messageDiv);
+            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+        }
+
+        async function sendMessage() {
+            const input = document.getElementById('message-input');
+            const userId = document.getElementById('userId').value;
+            const message = input.value.trim();
+
+            if (!message || !userId) return;
+
+            addMessage(message, true);
+            input.value = '';
+
+            try {
+                const response = await fetch('/hyperbot/chat', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/x-www-form-urlencoded',
+                    },
+                    body: new URLSearchParams({
+                        user_id: userId,
+                        message: message,
+                        'X-Quantum-Key': API_KEY
+                    })
+                });
+
+                if (response.ok) {
+                    const data = await response.json();
+                    addMessage(data.response);
+                } else {
+                    addMessage('Error: ' + response.statusText);
+                }
+            } catch (error) {
+                addMessage('Error: ' + error.message);
+            }
+        }
+
+        function handleKeyPress(event) {
+            if (event.key === 'Enter') {
+                sendMessage();
+            }
+        }
+
+        // Load conversation history on page load
+        window.onload = async function() {
+            const userId = document.getElementById('userId').value;
+            if (userId) {
+                try {
+                    const response = await fetch(`/hyperbot/history/${userId}?X-Quantum-Key=${API_KEY}`);
+                    if (response.ok) {
+                        const data = await response.json();
+                        data.history.reverse().forEach(item => {
+                            addMessage(item.input, true);
+                            addMessage(item.response);
+                        });
+                    }
+                } catch (error) {
+                    console.log('Could not load history:', error);
+                }
+            }
+        };
+    </script>
+</body>
+</html>
