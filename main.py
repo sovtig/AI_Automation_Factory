@@ -17,6 +17,8 @@ from datetime import datetime
 
 from workflows.task_manager import Task, TaskManager, TaskPriority, TaskStatus
 from workflows.file_manager import FileManager
+from hyperbot_db import hyperbot_db
+from hyperbot_ai import generate_response, ethical_check
 from loguru import logger
 import sys
 
@@ -54,6 +56,7 @@ class TaskResponse(BaseModel):
 @app.on_event("startup")
 async def startup():
     asyncio.create_task(task_manager.start())
+    await hyperbot_db.init_db()
     logger.info("AI Automation Factory started")
 
 @app.on_event("shutdown")
@@ -105,6 +108,84 @@ async def upload_file(file: UploadFile = File(...)):
 @app.get("/health")
 async def health():
     return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
+
+# HyperBot Models
+class ChatRequest(BaseModel):
+    user_id: str
+    message: str
+
+class ChatResponse(BaseModel):
+    response: str
+    timestamp: str
+
+class RealityOutputRequest(BaseModel):
+    spacetime_metrics: Dict[str, Any]
+
+class TimelineAdjustRequest(BaseModel):
+    delta_t: float  # in Planck times
+
+# HyperBot Endpoints
+@app.post("/hyperbot/chat", response_model=ChatResponse)
+async def hyperbot_chat(request: ChatRequest, x_quantum_key: str = Form(..., alias="X-Quantum-Key")):
+    if x_quantum_key != "quantum-key-secure":  # Simple check; in production, use proper validation
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+    # Get conversation history
+    history = await hyperbot_db.get_conversation_history(request.user_id)
+
+    # Generate response with dynamic learning
+    response_text = await generate_response(request.message, history)
+
+    # Ethical check
+    if not ethical_check(response_text):
+        response_text = "I'm sorry, but I cannot provide that response as it may violate ethical guidelines."
+
+    # Save conversation
+    await hyperbot_db.save_conversation(request.user_id, request.message, response_text)
+
+    return {"response": response_text, "timestamp": datetime.utcnow().isoformat()}
+
+@app.get("/hyperbot/history/{user_id}")
+async def get_history(user_id: str, x_quantum_key: str = Form(..., alias="X-Quantum-Key")):
+    if x_quantum_key != "quantum-key-secure":
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+    history = await hyperbot_db.get_conversation_history(user_id)
+    return {"history": history}
+
+@app.post("/hyperbot/reality/output")
+async def reality_output(request: RealityOutputRequest, x_quantum_key: str = Form(..., alias="X-Quantum-Key")):
+    if x_quantum_key != "quantum-key-secure":
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+    # Simulate reality output manipulation
+    result = {
+        "status": "success",
+        "manipulated_metrics": request.spacetime_metrics,
+        "simulation_note": "Quantum-classical hybrid simulation completed"
+    }
+    return result
+
+@app.post("/hyperbot/timeline/adjust")
+async def timeline_adjust(request: TimelineAdjustRequest, x_quantum_key: str = Form(..., alias="X-Quantum-Key")):
+    if x_quantum_key != "quantum-key-secure":
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+    # Simulate temporal adjustment
+    result = {
+        "status": "success",
+        "adjusted_timeline": f"Adjusted by {request.delta_t} Planck times",
+        "simulation_note": "Local spacetime geodesics controlled"
+    }
+    return result
+
+# Serve frontend
+from fastapi.staticfiles import StaticFiles
+app.mount("/static", StaticFiles(directory="static", html=True), name="static")
+
+@app.get("/")
+async def root():
+    return FileResponse("static/index.html")
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
